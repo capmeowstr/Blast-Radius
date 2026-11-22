@@ -1,0 +1,5 @@
+**
+!Dockerfile
+!selector.py
+!maps/
+!maps/coverage.*
