@@ -1,6 +1,9 @@
 """Select and schedule sqlglot regression tests from a unified diff."""
 
 import argparse
+import os
+import sys
+import time
 import ast
 import gzip
 import io
@@ -11,7 +14,7 @@ import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from bytecode_safety import same_executable_code
+from bytecode_safety import reshaped_functions, same_executable_code
 from comparison_types import ComparisonTypes
 from import_effects import executable_declarations_changed
 
@@ -47,7 +50,10 @@ def parse_patch(patch):
     changes = []
     entry = None
     hunk = None
+    headers = 0
     for line in patch.split("\n"):
+        if line.startswith("diff --git "):
+            headers += 1
         if hunk is not None and not hunk.complete and line.startswith((" ", "+", "-")):
             kind = line[0]
             hunk.changes.append((kind, line[1:]))
@@ -82,6 +88,10 @@ def parse_patch(patch):
             entry.hunks.append(hunk)
     if hunk is not None and not hunk.complete:
         raise ValueError("unterminated hunk")
+    # Every file in the diff must be accounted for: a header-only addition
+    # (an empty new module can shadow an installed package) has no hunks.
+    if headers > len(changes) or any(not change.hunks for change in changes):
+        raise ValueError("diff entry without textual hunks")
     return changes
 
 
@@ -173,7 +183,7 @@ def load_facts(path):
 
 class CoverageMap:
     def __init__(self, file, tests, *, reads=None, importers=None, types=None, shared_fixtures=None,
-                 initialization=None):
+                 initialization=None, touch=None):
         with gzip.open(file, "rt", encoding="utf-8") as stream:
             info = json.load(stream)
         self.names = info["tests"]
@@ -202,6 +212,8 @@ class CoverageMap:
         self.type_facts = None
         self.shared_fixtures = load_facts(shared_fixtures)
         self.initialization = load_facts(initialization)
+        self.touch = load_facts(touch)
+        self.class_names = {}
         self.all_tests = set(self.numbers.values())
         self.owned_tests = {}
         self.test_classes = {}
@@ -262,12 +274,21 @@ class CoverageMap:
         if all(not line.strip() or IDENTIFIER_COMMENT.fullmatch(line) for line in edits):
             if is_cosmetic(self.source_tree(path), revised_tree, edits):
                 return 0, False, False
+        if path not in self.compiled:
+            self.compiled[path] = compile(original, path, "exec", dont_inherit=True)
         if not any(DANGEROUS_BINDING.match(line) for line in edits):
-            if path not in self.compiled:
-                self.compiled[path] = compile(original, path, "exec", dont_inherit=True)
             if same_executable_code(self.compiled[path], compiled):
                 return 0, False, False
         lines = self.lookup(path)
+        # A changed generator flag or variable scope alters every call of the
+        # function, so select every test that executed any of its lines.
+        reshaped = 0
+        for first in reshaped_functions(self.compiled[path], compiled):
+            scope = next((item for item in scopes if item[0] <= first <= item[1] and item[3] == "function"), None)
+            if scope is None:
+                reshaped |= union(lines.values())
+            else:
+                reshaped |= union(lines.get(line, 0) for line in range(scope[0], scope[1] + 1))
         spans = ()
         if any(flow for _, _, flow in probes):
             if path not in self.source_spans:
@@ -293,6 +314,7 @@ class CoverageMap:
                         structural = True
                     candidate |= union(lines.get(line, 0) for line in range(start, end + 1))
             mask |= candidate
+        mask |= reshaped
         import_sensitive = any(
             start <= point <= end
             for start, end in self.initialization.get(path, ())
@@ -313,6 +335,69 @@ class CoverageMap:
                     mask = self.type_facts.candidates(path, self.source_tree(path), revised_tree, mask, lines)
         return mask, structural, import_sensitive
 
+    def class_qualnames(self, path):
+        """Map each class's (start, end) span to its qualified name."""
+        if path not in self.class_names:
+            spans = []
+
+            def walk(node, prefix):
+                for child in ast.iter_child_nodes(node):
+                    if isinstance(child, ast.ClassDef):
+                        name = prefix + child.name
+                        start = min([child.lineno, *[d.lineno for d in child.decorator_list]])
+                        spans.append((start, child.end_lineno, name))
+                        walk(child, name + ".")
+                    elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        walk(child, prefix + child.name + ".<locals>.")
+                    else:
+                        walk(child, prefix)
+
+            walk(self.source_tree(path), "")
+            self.class_names[path] = spans
+        return self.class_names[path]
+
+    def touched_tests(self, path, hunks, module_level=False):
+        """Tests that used a class whose body changed, or shared a setup that ran changed code.
+
+        module_level: the change alters code executed when the module is
+        imported, so a failure there reaches every user of every class the
+        module defines (subclasses included, via the recorded MROs).
+        """
+        if not self.touch:
+            return set()
+        names = self.touch["tests"]
+        original, scopes, *_ = self.files[path]
+        _, probes, _ = changes_to_lines(original, hunks)
+        points = {line for removed, inserted, _ in probes for line in (removed or [inserted])}
+        module = path[:-3].replace("/", ".")
+        if module.endswith(".__init__"):
+            module = module[: -len(".__init__")]
+        selected = set()
+        if module_level:
+            for _, _, name in self.class_qualnames(path):
+                for index in self.touch["classes"].get(module + ":" + name, ()):
+                    number = self.numbers.get(names[index])
+                    if number is not None:
+                        selected.add(number)
+        for point in points:
+            inner = next((item for item in scopes if item[0] <= point <= item[1]), None)
+            if inner is not None and inner[3] == "class" or (inner is not None and point < inner[2]):
+                # Class-level statement (or a def/class header): every user of
+                # the enclosing classes, including subclasses via recorded MROs.
+                for start, end, name in self.class_qualnames(path):
+                    if start <= point <= end:
+                        for index in self.touch["classes"].get(module + ":" + name, ()):
+                            number = self.numbers.get(names[index])
+                            if number is not None:
+                                selected.add(number)
+            for start, end, body, kind in scopes:
+                if kind == "function" and start <= point <= end:
+                    for index in self.touch["setup"].get(f"{path}:{start}", ()):
+                        name = names[index]
+                        owner = name.rpartition("::")[0]
+                        selected |= self.test_classes.get(owner) or self.owned_tests.get(name.split("::", 1)[0], set())
+        return selected
+
     def select(self, patch):
         all_tests = self.all_tests
         mask = 0
@@ -327,6 +412,8 @@ class CoverageMap:
                     return all_tests
                 if path in self.files:
                     bitmap, structural, import_sensitive = self.python_change(path, hunks, isolated=len(changes) == 1)
+                    if bitmap or structural or import_sensitive:
+                        selected |= self.touched_tests(path, hunks, module_level=import_sensitive)
                     mask |= bitmap
                     selected.update(self.numbers[name] for name in self.source_reads.get(path, ()) if name in self.numbers)
                     if import_sensitive:
@@ -380,6 +467,59 @@ def schedule(numbers, times):
     return best
 
 
+def schedule_cost(numbers, times):
+    workers = schedule(numbers, times)
+    return max(sum(times[n] for n in w) for w in workers) + 2000 * len(workers) if workers else 0
+
+
+def patched_files(base, patch):
+    """Revised text of every file the patch touches (None for deletions)."""
+    deleted = set(re.findall(r"^--- a/(\S+)\n\+\+\+ /dev/null", patch, re.M))
+    files = {}
+    for change in parse_patch(patch):
+        if change.path in deleted:
+            files[change.path] = None
+            continue
+        source = Path(base, change.path)
+        original = source.read_text(encoding="utf-8") if source.is_file() else ""
+        files[change.path], _, _ = changes_to_lines(original, change.hunks)
+    return files
+
+
+def verified(base, patch, selected, times, ids, numbers, started, budget):
+    """Run the selection when that is cheaper than printing it; keep failures."""
+    from verify import LAST_CPU, NEVER_RUN, P_PASS_DEFAULT, P_PASS_FIXTURE_ONLY, estimate_cpu_ms, run_tests
+
+    paths = re.findall(r"^diff --git a/(\S+)", patch, re.M)
+    fixture_only = bool(paths) and all(path.startswith("tests/fixtures/") for path in paths)
+    p_pass = P_PASS_FIXTURE_ONLY if fixture_only else P_PASS_DEFAULT
+
+    runnable = {n for n in selected if ids[n] not in NEVER_RUN}
+    best, gain = None, 0
+    # Option A: verify everything runnable. Option B: only tests under 2 s.
+    for plan in (runnable, {n for n in runnable if times[n] < 2000}):
+        if not plan:
+            continue
+        cpu = estimate_cpu_ms(times[n] for n in plan)
+        saving = p_pass * (schedule_cost(selected, times) - schedule_cost(selected - plan, times)) - cpu
+        if saving > gain:
+            best, gain = plan, saving
+    if best is None:
+        return selected
+    seconds = sum(times[n] for n in best) / 1000
+    deadline = 5 + 4 * seconds
+    if time.monotonic() - started + deadline > budget:
+        return selected
+    try:
+        files = patched_files(base, patch)
+    except (ValueError, OSError, UnicodeDecodeError):
+        return selected
+    failed = run_tests(base, files, [ids[n] for n in sorted(best)], deadline)
+    print(f"verified {len(best)} tests ({seconds:.2f}s recorded), {len(failed)} failing, "
+          f"child cpu {LAST_CPU[0]:.2f}s", file=sys.stderr)
+    return (selected - best) | {numbers[test_id] for test_id in failed}
+
+
 def main():
     cli = argparse.ArgumentParser()
     cli.add_argument("--data", type=Path, default=Path("/data"))
@@ -388,14 +528,29 @@ def main():
     cli.add_argument("--importers", type=Path, default=Path(__file__).with_name("maps") / "importers.json.gz")
     cli.add_argument("--types", type=Path, default=Path(__file__).with_name("maps") / "comparison-types.json.gz")
     cli.add_argument("--shared-fixtures", type=Path, default=Path(__file__).with_name("maps") / "shared-fixtures.json.gz")
+    cli.add_argument("--touch", type=Path, default=Path(__file__).with_name("maps") / "touch.json.gz")
     cli.add_argument("--initialization", type=Path, default=Path(__file__).with_name("maps") / "initialization-lines.json.gz")
+    cli.add_argument("--sqlglot", default=os.environ.get("SQLGLOT_BASE", "/opt/sqlglot"))
+    cli.add_argument("--no-verify", action="store_true")
+    cli.add_argument("--budget", type=float, default=float(os.environ.get("BLAST_BUDGET", "140")))
     args = cli.parse_args()
     tests = json.loads((args.data / "tests.json").read_text())["tests"]
     times = {test["number"]: round(test["seconds"] * 1000) for test in tests}
     coverage_map = CoverageMap(args.map, tests, reads=args.reads, importers=args.importers,
-                               types=args.types, shared_fixtures=args.shared_fixtures, initialization=args.initialization)
+                               types=args.types, shared_fixtures=args.shared_fixtures, initialization=args.initialization, touch=args.touch)
+    base = Path(args.sqlglot)
+    verifying = not args.no_verify and (base / "sqlglot" / "__init__.py").is_file()
+    ids = {test["number"]: test["id"] for test in tests}
+    numbers = {test["id"]: test["number"] for test in tests}
+    started = time.monotonic()
     for patch in sorted((args.data / "commits").glob("*.patch")):
-        selected = coverage_map.select(patch.read_text(encoding="utf-8", errors="replace"))
+        text = patch.read_text(encoding="utf-8", errors="replace")
+        selected = coverage_map.select(text)
+        if verifying and selected:
+            try:
+                selected = verified(base, text, selected, times, ids, numbers, started, args.budget)
+            except Exception as error:  # noqa: BLE001 - never lose a commit to the verifier
+                print(f"verify skipped: {error!r}", file=sys.stderr)
         print(json.dumps({"commit": patch.stem, "workers": schedule(selected, times)}, separators=(",", ":")))
 
 

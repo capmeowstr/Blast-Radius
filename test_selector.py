@@ -1,7 +1,7 @@
 import ast
 import unittest
 
-from bytecode_safety import same_executable_code
+from bytecode_safety import reshaped_functions, same_executable_code
 from comparison_types import changed_sites, equivalent
 from import_effects import executable_declarations_changed
 from selector import changes_to_lines, evaluation_spans, is_cosmetic, parse_patch, schedule
@@ -69,6 +69,21 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual(len(changed_sites(before, after)), 1)
         self.assertIsInstance(after.body[0].value.ops[0], ast.Eq)
         self.assertEqual(changed_sites(before, ast.parse("return y == None")), ())
+
+    def test_generator_flag_change_widens_to_function(self):
+        before = compile("def f(x):\n    if x:\n        return 1\n    return 2\n", "m.py", "exec")
+        after = compile("def f(x):\n    if x:\n        yield 1\n    return 2\n", "m.py", "exec")
+        self.assertEqual(reshaped_functions(before, after), {1})
+        local = compile("def g(a):\n    if a:\n        y = 1\n    return y\n", "m.py", "exec")
+        glob = compile("def g(a):\n    if a:\n        pass\n    return y\n", "m.py", "exec")
+        self.assertEqual(reshaped_functions(local, glob), {1})
+        self.assertEqual(reshaped_functions(before, before), set())
+
+    def test_header_only_entry_rejected(self):
+        diff = ("diff --git a/duckdb.py b/duckdb.py\nnew file mode 100644\nindex 0000000..e69de29\n"
+                "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n")
+        with self.assertRaises(ValueError):
+            parse_patch(diff)
 
 
 if __name__ == "__main__":

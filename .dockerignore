@@ -4,6 +4,8 @@
 !bytecode_safety.py
 !comparison_types.py
 !import_effects.py
+!verify.py
+!requirements.lock
 !maps/
 !maps/coverage.*
 !maps/*.json.gz
