@@ -44,6 +44,11 @@ def changed_sites(before, after):
                 continue
             change = frozenset((type(left.ops[0]), type(right.ops[0])))
             if change in (POSITIVE, NEGATIVE):
+                if isinstance(right.ops[0], (ast.Is, ast.IsNot)) and any(
+                    isinstance(node, ast.Constant) and node.value is not None and type(node.value) is not bool
+                    for node in (right.left, right.comparators[0])
+                ):
+                    continue
                 sites.append((left, change == NEGATIVE))
                 restored.append((right, right.ops[0]))
                 right.ops[0] = left.ops[0]

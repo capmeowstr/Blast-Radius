@@ -1,9 +1,13 @@
 **
 !Dockerfile
 !selector.py
-!bytecode_safety.py
 !comparison_types.py
-!import_effects.py
+!indexed_coverage.py
+!value_profile.py
+!tools/
+!tools/index_coverage.py
 !maps/
 !maps/coverage.*
-!maps/*.json.gz
+!maps/comparison-types.json.gz
+!maps/operand-values.json.gz
+!maps/source-reads.json.gz

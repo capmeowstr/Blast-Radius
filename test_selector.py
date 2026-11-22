@@ -4,7 +4,8 @@ import unittest
 from bytecode_safety import same_executable_code
 from comparison_types import changed_sites, equivalent
 from import_effects import executable_declarations_changed
-from selector import changes_to_lines, evaluation_spans, is_cosmetic, parse_patch, schedule
+from selector import bounded_schedule, changes_to_lines, cost, evaluation_spans, is_cosmetic, parse_patch, schedule
+from value_profile import UNKNOWN, freeze, same_result
 
 
 class SelectorTests(unittest.TestCase):
@@ -69,6 +70,21 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual(len(changed_sites(before, after)), 1)
         self.assertIsInstance(after.body[0].value.ops[0], ast.Eq)
         self.assertEqual(changed_sites(before, ast.parse("return y == None")), ())
+
+    def test_schedule_guard_fits_inside_the_original_cost(self):
+        times = {0: 4000, 1: 3000, 2: 1000, 3: 9000}
+        original = {0, 1}
+        selected = bounded_schedule(original, {0}, {2, 3}, times)
+        self.assertEqual({number for worker in selected for number in worker}, {0})
+        selected_with_check = bounded_schedule(original, {0}, {2}, times)
+        self.assertEqual({number for worker in selected_with_check for number in worker}, {0, 2})
+        self.assertLessEqual(cost(selected_with_check, times), cost(schedule(original, times), times))
+
+    def test_operand_value_proof_preserves_boundary_cases(self):
+        model = ast.Lt, ast.LtE, (UNKNOWN, UNKNOWN)
+        boundary = freeze((23, 12))
+        self.assertFalse(same_result(model, (boundary, boundary, False)))
+        self.assertTrue(same_result(model, (freeze((2**63 - 1,)), boundary, False)))
 
 
 if __name__ == "__main__":
