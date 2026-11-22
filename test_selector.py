@@ -1,6 +1,9 @@
 import ast
 import unittest
 
+from bytecode_safety import same_executable_code
+from comparison_types import changed_sites, equivalent
+from import_effects import executable_declarations_changed
 from selector import changes_to_lines, evaluation_spans, is_cosmetic, parse_patch, schedule
 
 
@@ -34,6 +37,38 @@ class SelectorTests(unittest.TestCase):
         self.assertEqual(schedule([0, 1], {0: 4000, 1: 3000}), [[0], [1]])
         self.assertEqual(schedule([0, 1], {0: 2000, 1: 2000}), [[0, 1]])
         self.assertEqual(schedule([], {}), [])
+
+    def test_changes_to_import_initialization(self):
+        before = ast.parse('class Base:\n    x = ","\n    __slots__ = ("valid",)\n')
+        after = ast.parse('class Base:\n    x = int("bad")\n    __slots__ = ("valid",)\n')
+        slots = ast.parse('class Base:\n    x = ","\n    __slots__ = ("bad-name",)\n')
+        self.assertTrue(executable_declarations_changed(before, after))
+        self.assertTrue(executable_declarations_changed(before, slots))
+        early = ast.parse('class Base:\n    _names = ("valid",)\n    __slots__ = _names\n')
+        broken = ast.parse('class Base:\n    _names = ("bad-name",)\n    __slots__ = _names\n')
+        self.assertTrue(executable_declarations_changed(early, broken))
+
+    def test_statement_body_change_leaves_declarations_unchanged(self):
+        before = ast.parse("def f():\n    return 1\n")
+        after = ast.parse("def f():\n    return 2\n")
+        self.assertFalse(executable_declarations_changed(before, after))
+
+    def test_bytecode_constant_folding_preserves_values_and_types(self):
+        original = compile("x = 1 + 2", "test.py", "exec")
+        self.assertTrue(same_executable_code(original, compile("# comment\nx = 3", "test.py", "exec")))
+        self.assertFalse(same_executable_code(original, compile("x = 3.0", "test.py", "exec")))
+
+    def test_identity_and_equality_keep_custom_dispatch(self):
+        obj = ("example.Value", "builtins.object", "builtins.object", False)
+        none = ("builtins.NoneType", "builtins.object", "builtins.object", False)
+        custom = ("example.Value", "example.Value", "builtins.object", False)
+        self.assertTrue(equivalent((obj, none, False), False))
+        self.assertFalse(equivalent((custom, none, False), False))
+        before = ast.parse("return x is None")
+        after = ast.parse("return x == None")
+        self.assertEqual(len(changed_sites(before, after)), 1)
+        self.assertIsInstance(after.body[0].value.ops[0], ast.Eq)
+        self.assertEqual(changed_sites(before, ast.parse("return y == None")), ())
 
 
 if __name__ == "__main__":

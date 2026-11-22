@@ -1,5 +1,9 @@
 **
 !Dockerfile
 !selector.py
+!bytecode_safety.py
+!comparison_types.py
+!import_effects.py
 !maps/
 !maps/coverage.*
+!maps/*.json.gz

@@ -3,14 +3,23 @@
 import argparse
 import ast
 import gzip
+import io
 import json
 import re
+import tokenize
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from bytecode_safety import same_executable_code
+from comparison_types import ComparisonTypes
+from import_effects import executable_declarations_changed
 
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,(\d+))? @@")
 IDENTIFIER_COMMENT = re.compile(r"^\s*#(?!(?:\s*type\s*:|\s*!|.*coding[=:])).*$")
 CONTROL_FLOW = re.compile(r"\b(?:and|or|not|if|elif|while|for|in|return|raise|except|match|case)\b")
+DANGEROUS_BINDING = re.compile(r"^\s*(?:(?:from|import|class|def|async def|raise|del)\b|@|__all__\b)")
+IDENTITY_OPERATOR = re.compile(r"\bis\b")
 DIALECT_DIRS = ("dialects", "generators", "parsers", "typing")
 BROAD_DIALECTS = frozenset({"dialect"})
 
@@ -38,7 +47,7 @@ def parse_patch(patch):
     changes = []
     entry = None
     hunk = None
-    for line in patch.splitlines():
+    for line in patch.split("\n"):
         if hunk is not None and not hunk.complete and line.startswith((" ", "+", "-")):
             kind = line[0]
             hunk.changes.append((kind, line[1:]))
@@ -78,7 +87,9 @@ def parse_patch(patch):
 
 def changes_to_lines(original, hunks):
     """Reconstruct what the diff means without running changed code."""
-    old = original.splitlines()
+    old = original.split("\n")
+    if old[-1] == "":
+        old.pop()
     new = []
     probes = []
     edits = []
@@ -123,14 +134,17 @@ def changes_to_lines(original, hunks):
 def is_cosmetic(original, revised_tree, edits):
     if not all(not line.strip() or IDENTIFIER_COMMENT.fullmatch(line) for line in edits):
         return False
-    before = ast.parse(original, type_comments=True)
+    before = ast.parse(original, type_comments=True) if isinstance(original, str) else original
+    if hasattr(ast, "compare"):
+        return ast.compare(before, revised_tree)
     return ast.dump(before) == ast.dump(revised_tree)
 
 
 def evaluation_spans(source):
     """Expand across an expression whose earlier operands can short-circuit."""
     spans = set()
-    for node in ast.walk(ast.parse(source)):
+    tree = ast.parse(source) if isinstance(source, str) else source
+    for node in ast.walk(tree):
         expression = None
         if isinstance(node, (ast.If, ast.While, ast.Assert)):
             expression = node.test
@@ -150,8 +164,16 @@ def union(items):
     return result
 
 
+def load_facts(path):
+    if path is None or not path.is_file():
+        return {}
+    with gzip.open(path, "rt", encoding="utf-8") as stream:
+        return json.load(stream)
+
+
 class CoverageMap:
-    def __init__(self, file, tests):
+    def __init__(self, file, tests, *, reads=None, importers=None, types=None, shared_fixtures=None,
+                 initialization=None):
         with gzip.open(file, "rt", encoding="utf-8") as stream:
             info = json.load(stream)
         self.names = info["tests"]
@@ -171,6 +193,28 @@ class CoverageMap:
         }
         self.tests = tests
         self.decoded = {}
+        self.source_trees = {}
+        self.source_spans = {}
+        self.compiled = {}
+        self.source_reads = load_facts(reads).get("source", {})
+        self.importers = load_facts(importers)
+        self.type_path = types
+        self.type_facts = None
+        self.shared_fixtures = load_facts(shared_fixtures)
+        self.initialization = load_facts(initialization)
+        self.all_tests = set(self.numbers.values())
+        self.owned_tests = {}
+        self.test_classes = {}
+        for test in tests:
+            self.owned_tests.setdefault(test["file"], set()).add(test["number"])
+            owner, _, method = test["id"].rpartition("::")
+            if method:
+                self.test_classes.setdefault(owner, set()).add(test["number"])
+
+    def source_tree(self, path):
+        if path not in self.source_trees:
+            self.source_trees[path] = ast.parse(self.files[path][0], type_comments=True)
+        return self.source_trees[path]
 
     def lookup(self, path):
         if path not in self.decoded:
@@ -201,16 +245,34 @@ class CoverageMap:
             if number is not None:
                 yield number
 
-    def python_change(self, path, hunks):
+    def python_change(self, path, hunks, isolated=False):
         original, scopes, *_ = self.files[path]
         revised, probes, edits = changes_to_lines(original, hunks)
         if not probes:
             raise ValueError("change has no hunks")
-        revised_tree = ast.parse(revised, type_comments=True)
-        if is_cosmetic(original, revised_tree, edits):
-            return 0, False
+        hints = {line for removed, inserted, _ in probes for line in (removed or [inserted])}
+        if min(hints) <= 2:
+            encoding, _ = tokenize.detect_encoding(io.BytesIO(revised.encode("utf-8")).readline)
+            if encoding != "utf-8":
+                raise ValueError("source encoding changed")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", SyntaxWarning)
+            revised_tree = ast.parse(revised, type_comments=True)
+            compiled = compile(revised_tree, path, "exec", dont_inherit=True)
+        if all(not line.strip() or IDENTIFIER_COMMENT.fullmatch(line) for line in edits):
+            if is_cosmetic(self.source_tree(path), revised_tree, edits):
+                return 0, False, False
+        if not any(DANGEROUS_BINDING.match(line) for line in edits):
+            if path not in self.compiled:
+                self.compiled[path] = compile(original, path, "exec", dont_inherit=True)
+            if same_executable_code(self.compiled[path], compiled):
+                return 0, False, False
         lines = self.lookup(path)
-        spans = evaluation_spans(original) if any(flow for _, _, flow in probes) else ()
+        spans = ()
+        if any(flow for _, _, flow in probes):
+            if path not in self.source_spans:
+                self.source_spans[path] = evaluation_spans(self.source_tree(path))
+            spans = self.source_spans[path]
         mask = 0
         structural = False
         for removed, insert_at, flow in probes:
@@ -231,13 +293,28 @@ class CoverageMap:
                         structural = True
                     candidate |= union(lines.get(line, 0) for line in range(start, end + 1))
             mask |= candidate
-        if structural:
+        import_sensitive = any(
+            start <= point <= end
+            for start, end in self.initialization.get(path, ())
+            for point in hints
+        )
+        if structural or any(not removed for removed, _, _ in probes) or any(
+            DANGEROUS_BINDING.match(line) for line in edits
+        ):
+            import_sensitive |= executable_declarations_changed(self.source_tree(path), revised_tree)
+        if structural or import_sensitive:
             mask |= self.dialect_family(path)
             mask |= union(lines.values())
-        return mask, structural
+        elif isolated and mask:
+            if self.type_path and any(IDENTITY_OPERATOR.search(line) for line in edits):
+                if self.type_facts is None and self.type_path.is_file():
+                    self.type_facts = ComparisonTypes(self.type_path, len(self.names))
+                if self.type_facts is not None:
+                    mask = self.type_facts.candidates(path, self.source_tree(path), revised_tree, mask, lines)
+        return mask, structural, import_sensitive
 
     def select(self, patch):
-        all_tests = set(self.numbers.values())
+        all_tests = self.all_tests
         mask = 0
         selected = set()
         try:
@@ -249,8 +326,14 @@ class CoverageMap:
                 if not hunks:
                     return all_tests
                 if path in self.files:
-                    bitmap, structural = self.python_change(path, hunks)
+                    bitmap, structural, import_sensitive = self.python_change(path, hunks, isolated=len(changes) == 1)
                     mask |= bitmap
+                    selected.update(self.numbers[name] for name in self.source_reads.get(path, ()) if name in self.numbers)
+                    if import_sensitive:
+                        for owner in self.importers.get(path, ()):
+                            selected.update(self.owned_tests.get(owner, ()))
+                        if path.split("/")[1] in DIALECT_DIRS:
+                            selected |= self.language_tests
                     if structural and not bitmap:
                         if path.split("/")[1] in DIALECT_DIRS:
                             selected |= self.language_tests
@@ -258,16 +341,18 @@ class CoverageMap:
                             return all_tests
                 elif path in self.fixtures:
                     mask |= int(self.fixtures[path], 16)
+                    for owner in self.shared_fixtures.get(path, ()):
+                        selected.update(self.test_classes.get(owner, ()))
                 elif path.startswith("tests/") and path.endswith(".py"):
-                    owned = {test["number"] for test in self.tests if test["file"] == path}
-                    if not owned:
+                    owned = self.owned_tests.get(path)
+                    if not owned or path == "tests/dialects/test_dialect.py":
                         return all_tests
                     selected |= owned
                 elif path.startswith(("docs/", ".github/")) or path in ("README.md", "CHANGELOG.md"):
                     selected |= {test["number"] for test in self.tests if test["file"] == "tests/test_docs.py"}
                 else:
                     return all_tests
-        except (ValueError, SyntaxError, RecursionError):
+        except (ValueError, SyntaxError, SyntaxWarning, RecursionError):
             return all_tests
         return selected | set(self.selected_ids(mask))
 
@@ -299,10 +384,16 @@ def main():
     cli = argparse.ArgumentParser()
     cli.add_argument("--data", type=Path, default=Path("/data"))
     cli.add_argument("--map", type=Path, default=Path(__file__).with_name("coverage-map.json.gz"))
+    cli.add_argument("--reads", type=Path, default=Path(__file__).with_name("maps") / "source-reads.json.gz")
+    cli.add_argument("--importers", type=Path, default=Path(__file__).with_name("maps") / "importers.json.gz")
+    cli.add_argument("--types", type=Path, default=Path(__file__).with_name("maps") / "comparison-types.json.gz")
+    cli.add_argument("--shared-fixtures", type=Path, default=Path(__file__).with_name("maps") / "shared-fixtures.json.gz")
+    cli.add_argument("--initialization", type=Path, default=Path(__file__).with_name("maps") / "initialization-lines.json.gz")
     args = cli.parse_args()
     tests = json.loads((args.data / "tests.json").read_text())["tests"]
     times = {test["number"]: round(test["seconds"] * 1000) for test in tests}
-    coverage_map = CoverageMap(args.map, tests)
+    coverage_map = CoverageMap(args.map, tests, reads=args.reads, importers=args.importers,
+                               types=args.types, shared_fixtures=args.shared_fixtures, initialization=args.initialization)
     for patch in sorted((args.data / "commits").glob("*.patch")):
         selected = coverage_map.select(patch.read_text(encoding="utf-8", errors="replace"))
         print(json.dumps({"commit": patch.stem, "workers": schedule(selected, times)}, separators=(",", ":")))
